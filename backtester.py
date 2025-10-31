@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 import plotly.graph_objs as go
 import plotly.io as pio
 import logging
+import sklearn as sk
+import hmmlearn as hmm
 
 class InsufficientCash(Exception):
     """Raised when the backtest runs out of cash."""
@@ -14,6 +16,7 @@ class Backtester:
         A class to prepare data, generate positions, run a simple backtest,
         compute performance metrics, and plot results (static & interactive).
     """
+
     def __init__(self, df: pd.DataFrame, start_date: str, end_date: str, init_cash: float = 10_000, num_trades: int = 20):
         """
             df:           intraday-filtered DataFrame with a DatetimeIndex and columns
@@ -100,18 +103,296 @@ class Backtester:
 ### DO NOT CHANGE ANYTHING ABOVE THIS LINE ### 
 ##############################################
     
-    def _generate_positions(self, price: pd.Series) -> np.ndarray:
+    def _generate_positions(self, df: pd.DataFrame) -> np.ndarray:
+
         """
             TODO: 
             - Code your logic here. Note that you have access to price of a specific stock, which is a pandas series. 
             - You may want to look into previous returns, rolling average, price/return volatility and the like.
             - You may want to analyze using the original .csv file for any statistically significant patterns of each price time series, 
               and apply it in this function
-        """
-        n = len(price)
-        pos = np.zeros(n, dtype=int)
+        """            
+
+        def buy_and_hold():
+            n = len(df)
+            pos_math = np.zeros(n, dtype=int)
+            pos_stat = np.zeros(n, dtype=int)
+
+            for i in range(n):
+                pos_math[i] = 1
+                pos_stat[i] = 1
+
+            pos_math[n-1] = 0
+            pos_stat[n-1] = 0
+
+            symbols = {'MATH': pos_math, 'STAT': pos_stat}
+
+            for ticker, position in symbols.items():
+                df[f'Position_{ticker}'] = position
+
+        def ewmac():
+            """
+            EWMAC (Exponential Weighted Moving Average Crossover) strategy using intraday prices.
+            - Uses 200-period and 1000-period EMAs on 5-minute data
+            - Fast EMA (200) vs Slow EMA (1000) crossover strategy
+            """
+            n = len(df)
+            pos_stat = np.zeros(n, dtype=int)
+            
+            # Calculate EMAs on intraday 5-minute data
+            ema_200 = df['STAT'].ewm(span=200).mean()   # Fast EMA (200 periods = ~15 hours)
+            ema_1000 = df['STAT'].ewm(span=1000).mean() # Slow EMA (1000 periods = ~3.6 days)
+
+            for i in range(n):
+                if i < 1000:  # Wait for slow EMA to be meaningful
+                    pos_stat[i] = 0  # Hold neutral during warmup
+                else:
+                    # Compare EMAs at this time step
+                    if ema_200.iloc[i] > ema_1000.iloc[i]:
+                        pos_stat[i] = 1   # Long signal (fast EMA above slow EMA)
+                    elif ema_200.iloc[i] < ema_1000.iloc[i]:
+                        pos_stat[i] = -1  # Short signal (fast EMA below slow EMA)
+                    else:
+                        pos_stat[i] = pos_stat[i-1] if i > 0 else 0  # Carry forward previous position
+
+            symbols = {"STAT": pos_stat}
+
+            for ticker, position in symbols.items():
+                df[f"Position_{ticker}"] = position
+            
+
+        def trend_line_breakout():
+            #72 hour lookback
+
+
+            def check_trend_line(support: bool, pivot: int, slope: float, y: np.array):
+                # compute sum of differences between line and prices, 
+                # return negative val if invalid 
+                # Find the intercept of the line going through pivot point with given slope
+                intercept = -slope * pivot + y[pivot]
+                line_vals = slope * np.arange(len(y)) + intercept
+                diffs = line_vals - y
+    
+                # Check to see if the line is valid, return -1 if it is not valid.
+                if support and diffs.max() > 1e-5:
+                    return -1.0
+                elif not support and diffs.min() < -1e-5:
+                    return -1.0
+
+                # Squared sum of diffs between data and line 
+                err = (diffs ** 2.0).sum()
+                return err
         
-        return pos
+
+
+
+        def hidden_markov_model():
+            """
+            HMM-based regime signals for every strategy symbol in self.strats.
+
+            Behaviour (simple and easy to read):
+            - Uses a rolling window of past returns (window_size) to train a
+              3-state Gaussian HMM. Training is performed once per calendar month
+              (when we first encounter a new month in the index) using the
+              most-recent `window_size` returns.
+            - For each timestamp we compute the HMM posterior for the latest
+              return. If the most-positive-state probability > most-negative-state
+              probability -> +1, and vice-versa -> -1; otherwise 0.
+            - If hmmlearn is unavailable or the model fails, we fall back to a
+              simple tercile rule computed from the same rolling window.
+
+            Outputs integer signals {-1, 0, 1} in columns named `Position_{symbol}`.
+            """
+
+            window_size = 150  # number of most-recent returns used for training
+            n = len(df)
+
+            # loop symbols and produce a position series per symbol
+            for s in self.strats:
+                price = df[s].ffill().bfill()
+                rets = price.pct_change().fillna(0)
+
+                pos = np.zeros(n, dtype=int)
+
+                # keep a model reference and the month it was last trained on
+                model = None
+                last_model_month = None
+
+                # We will compute training-state mean mapping on each retrain
+                state_mean_map = None
+
+                for i in range(n):
+                    # current timestamp and return
+                    ts = df.index[i]
+                    cur_ret = rets.iat[i]
+                    cur_month = ts.month
+
+                    # retrain at month boundary once we have enough history
+                    if i >= window_size and cur_month != last_model_month:
+                        X = rets.iloc[i - window_size:i].values.reshape(-1, 1)
+                        try:
+                            # import locally so top-level import isn't required
+                            from hmmlearn.hmm import GaussianHMM
+
+                            model = GaussianHMM(n_components=3, covariance_type='full', n_iter=100, random_state=100)
+                            model.fit(X)
+
+                            # determine which HMM state is low/mid/high by mean return
+                            states = model.predict(X)
+                            state_means = {st: X[states == st].mean() for st in np.unique(states)}
+                            # sort states by mean return: lowest -> highest
+                            sorted_states = sorted(state_means, key=lambda k: state_means[k])
+                            if len(sorted_states) == 3:
+                                low_state, mid_state, high_state = sorted_states
+                                state_mean_map = {'low': low_state, 'mid': mid_state, 'high': high_state}
+                            else:
+                                # unexpected: fallback to None to force tercile fallback later
+                                model = None
+                                state_mean_map = None
+
+                        except Exception:
+                            # any error using HMM -> disable model and fall back
+                            model = None
+                            state_mean_map = None
+
+                        last_model_month = cur_month
+
+                    # decide position using trained model (if available) or terciles
+                    if model is not None:
+                        try:
+                            probs = model.predict_proba(np.array([[cur_ret]])) .flatten()
+                            # safety: ensure we have a mapping from state index -> mean rank
+                            if state_mean_map is not None:
+                                # index of the high/low states
+                                high_idx = int(state_mean_map['high'])
+                                low_idx = int(state_mean_map['low'])
+
+                                if probs[high_idx] > probs[low_idx]:
+                                    pos[i] = 1
+                                elif probs[low_idx] > probs[high_idx]:
+                                    pos[i] = -1
+                                else:
+                                    pos[i] = 0
+                            else:
+                                # unexpected: fallback to 0
+                                pos[i] = 0
+                        except Exception:
+                            # model prediction failed -> fallback to tercile rule below
+                            model = None
+
+                    if model is None:
+                        # compute terciles on the same rolling window (or available history)
+                        if i >= window_size:
+                            window_vals = rets.iloc[i - window_size:i].values
+                        else:
+                            window_vals = rets.iloc[:i + 1].values
+
+                        lo = np.nanpercentile(window_vals, 33) if len(window_vals) > 0 else 0.0
+                        hi = np.nanpercentile(window_vals, 66) if len(window_vals) > 0 else 0.0
+
+                        if cur_ret > hi:
+                            pos[i] = 1
+                        elif cur_ret < lo:
+                            pos[i] = -1
+                        else:
+                            # carry forward prior non-na position where possible
+                            pos[i] = pos[i - 1] if i > 0 else 0
+
+                # write the integer positions back into the dataframe
+                df[f'Position_{s}'] = pos.astype(int)   
+                
+                       
+        def math_stat_soci_arbitrage():
+            n = len(df)
+            pos_soth = np.zeros(n, dtype=int)
+            pos_math = np.zeros(n, dtype=int)
+            pos_soci = np.zeros(n, dtype=int)
+
+            df['MATH_Returns'] = df['MATH'].pct_change().fillna(0.0)
+            df['SOCI_Returns'] = df['SOCI'].pct_change().fillna(0.0)
+            df['SOTH_Returns'] = df['SOTH'].pct_change().fillna(0.0)
+            math_return = df['MATH_Returns'].to_numpy()
+            soci_return = df['SOCI_Returns'].to_numpy()
+            soth_return = df['SOTH_Returns'].to_numpy()
+
+            for i in range(n):
+                avg_math_soci_return = (soci_return[i] + math_return[i]) / 2
+                positive_diff = soth_return[i] - avg_math_soci_return
+
+            #if the SOTH index is overpriced, short SOTH and long MATH and SOCI
+            if positive_diff > (0.05 / 100):
+                pos_math[i] = 0.5
+                pos_soci[i] = 0.5
+                pos_soth[i] = -1
+            #vice versa, if SOTH is underpriced, long SOTH and short MATH and SOCI
+            elif positive_diff < (-0.05 / 100):
+                pos_math[i] = -0.5
+                pos_soci[i] = -0.5
+                pos_soth[i] = 1
+            #if they converge and have a mis-pricing of less than +/-0.5 on either side
+            else:
+                pos_math[i] = 0
+                pos_soci[i] = 0
+                pos_soth[i] = 0
+                
+            symbols = {"MATH": pos_math, "SOCI": pos_soci, "SOTH": pos_soth}
+
+            for ticker, position in symbols.items():
+                df[f"Position_{ticker}"] = position
+        def mean_reversion(price):
+            # use RSI and Bollinger Bands
+            # RSI period = 6 DAYS, Bollinger Bands period = 20 DAYS
+            # I noticed that each day has 68 entry times
+            # So:
+                # bollinger period = 20 * 68
+                # rsi period = 6 * 68
+
+            n = len(df)
+            pos_math = np.zeros(n, dtype=int)
+
+            symbols = {'MATH': pos_math}
+            for ticker, position in symbols.items():
+                df[f'Position_{ticker}'] = position
+
+            # Bollinger bands
+            bollinger_period = 6
+            sma_20 = price.rolling(window = bollinger_period).mean()
+            stdev_20 = price.rolling(window = bollinger_period).std()
+
+            upper_bollinger = sma_20 + 2 * stdev_20
+            lower_bollinger = sma_20 - 2 * stdev_20
+
+            # RSI Indicators
+            rsi_period = 2
+            returns = price.pct_change()
+            average_gain = returns.clip(lower = 0).ewm(rsi_period).mean()
+            average_loss = (returns.clip(upper = 0) * -1).ewm(rsi_period).mean()
+
+            rsi_index =  100 - (100 / (1 + average_gain / average_loss))
+
+            # Implementation: If price > upper bollinger AND RSI > 70, short. 
+            # If price < lower bollinger AND RSI < 30, long.
+
+            n = len(price)
+            pos = np.zeros(n, dtype=int)
+
+            for i in range(bollinger_period, n):
+                if price.iat[i] > upper_bollinger.iat[i] and rsi_index.iat[i] > 70:
+                    pos[i] = -1
+                elif price.iat[i] < lower_bollinger.iat[i] and rsi_index.iat[i] < 30:
+                    pos[i] = 1
+                else:
+                    pos[i] = pos[i-1] #carry forward previous position
+
+            return pos
+        
+            symbols = {"MATH": pos_math, "SOCI": pos_soci, "SOTH": pos_soth}
+
+            for ticker, position in symbols.items():
+                df[f"Position_{ticker}"] = position
+
+        #Call function in main
+        ewmac()
 
     def prepare_data(self):
         """
@@ -133,15 +414,11 @@ class Backtester:
         # Seed for reproducibility
         np.random.seed(42)
 
-        for s in self.strats:
-            # df[f'Position_{s}'] = self._generate_random_positions(len(df), self.num_trades)
-            if s != 'SOTH':
-                df[f'Position_{s}'] = self._generate_sma_positions(df[s])
-            else:
-                pass
-            
-            # df[f'Position_{s}'] = self._generate_positions(len(df), self.num_trades) 
-            # # TODO: Uncomment above line to activate your trading positions for backtesting
+        # Call the function to generate positions
+
+        self._generate_positions(df)
+
+        # # TODO: Uncomment above line to activate your trading positions for backtesting
         
 ##############################################
 ### DO NOT CHANGE ANYTHING BELOW THIS LINE ### 
